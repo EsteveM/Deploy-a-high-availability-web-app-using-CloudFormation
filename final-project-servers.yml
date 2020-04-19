@@ -1,0 +1,161 @@
+Description: >
+    Esteban / Udacity 2020
+########################################
+# CloudFormation script - SERVERS PART #
+########################################
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+Resources:
+  # The load balancer should allow all public traffic on port 80 inbound,
+  # which is the default HTTP port. Outbound, it will only be using port 80 to reach
+  # the internal servers.
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+  # The application communicates on the default HTTP Port 80, so the servers will need this inbound
+  # port open since it will be used with the Load Balancer and the Load Balancer Health Check.
+  # As for outbound, the servers will need unrestricted Internet access to be able to download and
+  # update its software.
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+  # Instance profile contains the IAM Role names that we want to associate to our auto scaling EC2
+  # Servers. In this example, a Role called UdacityS3ReadOnlyC2 is created and just given a policy of
+  # S3 Read-Only Access
+  # Since the application will be downloaded from an archive from an S3 Bucket, an IAM Role has also
+  # been created, but from the console this time, so that instances can use the S3 Service.
+  ProfileWithRolesForOurApp:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles:
+        - UdacityS3ReadOnlyEC2
+  # A Launch Configuration is created for the application servers in order to deploy four servers,
+  # two located in each of your private subnets.
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install apache2 awscli -y
+          systemctl start apache2.service
+          cd /var/www/html
+          aws s3 cp s3://esteban-project-bucket/index.html index.html
+      ImageId: ami-0d1cd67c26f5fca19
+      # Ubuntu Server 18.04 LTS HVM, SSD Volume Type - ami-0d1cd67c26f5fca19 64-bit x86
+      # ami-0fc025e3171c5a1bf 64-bit Arm
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      # 2 vCPUs, 4 GiB Memory
+      InstanceType: t3.medium
+      IamInstanceProfile: 
+        Ref: ProfileWithRolesForOurApp
+      # Allocation of 10GB of disk space so that we don t run into issues.
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+  # The launch configuration will be used by an auto-scaling group.
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MinSize: '4'
+      MaxSize: '4'
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+  # The application needs to be deployed into private subnets with the Load Balancer located in
+  # a public subnet.
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: '80'
+      Protocol: HTTP
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Load balancer health checks
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+
+Outputs:
+  # One of the output exports of the CloudFormation script is the public URL of the LoadBalancer.
+  # http has been added in front of the load balancer DNS Name in the output, for convenience.
+  WebAppLB:
+      Description: The public URL of the LoadBalancer
+      # See AWSCloudFormation documentation on AWS
+      # to view available attributes and sample return values for LoadBalancer
+      # The join function is used to combine values, without delimiter.
+      Value: !Join [ "", [ "http://", !GetAtt WebAppLB.DNSName ]]
+      Export:
+        Name: !Sub ${EnvironmentName}-LB-URL
